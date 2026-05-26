@@ -21,6 +21,7 @@
 9. [验证集群](#9-验证集群)
 10. [安装 Kubernetes Dashboard (可选)](#10-安装-kubernetes-dashboard-可选)
 11. [常见问题排查](#11-常见问题排查)
+12. [服务器重启](#12-服务器重启)
 
 ---
 
@@ -30,8 +31,8 @@
 |------|------|
 | 操作系统 | Ubuntu 22.04 LTS (amd64) |
 | CPU | 至少 2 核 |
-| 内存 | 至少 2GB (推荐 4GB+) |
-| 磁盘 | 至少 20GB 可用空间 |
+| 内存 | 至少 2GB (推荐 4GB+) (应为有后续的操作实验, 这里采用的12G) |
+| 磁盘 | 至少 20GB 可用空间 (应为有后续的操作实验, 这里采用的80G) |
 | 网络 | 公网或内网可访问 apt 仓库 |
 | 主机名 | **不能是 `localhost`**（需要可解析的唯一主机名） |
 
@@ -747,6 +748,93 @@ sudo ufw allow 10250/tcp
 sudo ufw allow 10259/tcp
 sudo ufw allow 10257/tcp
 ```
+
+
+
+## 12 服务器重启 , 扩容磁盘
+
+```bash
+# 磁盘使用情况
+df -h
+
+
+soson@k8s-master:~$ df -h
+Filesystem                         Size  Used Avail Use% Mounted on
+tmpfs                              1.2G  1.4M  1.2G   1% /run
+efivarfs                           256K   33K  224K  13% /sys/firmware/efi/efivars
+/dev/mapper/ubuntu--vg-ubuntu--lv   19G   17G  1.1G  94% /
+tmpfs                              5.9G     0  5.9G   0% /dev/shm
+tmpfs                              5.0M     0  5.0M   0% /run/lock
+/dev/nvme0n1p2                     2.0G  195M  1.6G  11% /boot
+/dev/nvme0n1p1                     1.1G  6.4M  1.1G   1% /boot/efi
+tmpfs                              1.2G   12K  1.2G   1% /run/user/1000
+
+# 根分区只剩 1.1G（使用率 94%），K8s 的驱逐阈值默认是 85%，所以一直在驱逐 Pod
+# 关闭虚拟机加磁盘空间。 加完开机
+# 我用的是 Ubuntu LVM，查看 VG 的空闲空间。 VG 有 18.47G 空闲
+sudo vgdisplay | grep -E "VG Name|Free"
+sudo lvdisplay | grep -E "LV Path|LV Size"
+
+son@k8s-master:~$ sudo vgdisplay | grep -E "VG Name|Free"
+[sudo] password for son: 
+  VG Name               ubuntu-vg
+  Free  PE / Size       4729 / 18.47 GiB
+son@k8s-master:~$ sudo lvdisplay | grep -E "LV Path|LV Size"
+  LV Path                /dev/ubuntu-vg/ubuntu-lv
+  LV Size                18.47 GiB
+  
+
+# 扩容
+# 1. 扩展逻辑卷到全部可用空间
+sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+
+# 2. 扩展文件系统
+sudo resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv
+
+# 3. 确认结果
+df -h /
+
+```
+
+
+
+```bash
+# 查看 swap 分区是否关闭
+free -h
+
+# 关闭 swap 分区
+sudo swapoff -a
+
+# 去人 kubelet 状态
+sudo systemctl status kubelet
+sudo systemctl start kubelet   # 如果没在跑
+sudo systemctl enable kubelet  # 确保开机自启
+
+# 检查节点状态. 正常应该显示 Ready，如果是 NotReady 等一两分钟，Calico 需要时间启动。
+kubectl get nodes
+
+# 第三步：检查系统 Pod 是否全部起来
+kubectl get pods -A
+
+# 1. 先暂停，不再创建新 Pod
+kubectl scale deployment tigera-operator -n tigera-operator --replicas=0
+# 2. 等几秒确认没有新 Pod 产生
+kubectl get pods -n tigera-operator
+
+
+# 3. 清理所有 Evicted Pod
+kubectl get pods -A | grep Evicted | awk '{print $1, $2}' | xargs -n2 kubectl delete pod -n
+# 3. 清理 ContainerStatusUnknown 的僵尸 Pod
+kubectl get pods -A | grep -E "ContainerStatusUnknown|Evicted|Error" | awk '{print $1, $2}' | xargs -n2 kubectl delete pod -n
+
+# 4. 恢复 operator（缩回1个）
+kubectl scale deployment tigera-operator -n tigera-operator --replicas=1
+
+# 观察恢复情况
+watch kubectl get pods -A
+```
+
+
 
 ---
 

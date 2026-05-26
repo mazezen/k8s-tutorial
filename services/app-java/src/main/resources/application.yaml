@@ -1,0 +1,6 @@
+spring:
+  application:
+    name: app-java
+
+server:
+  port: 8897
